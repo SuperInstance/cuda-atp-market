@@ -1,0 +1,9 @@
+[package]
+name = "cuda-atp-market"
+version = "0.1.0"
+edition = "2021"
+description = "ATP Energy Market system for FLUX agent fleets — CUDA-accelerated metabolic economics"
+
+[dependencies]
+
+[dev-dependencies]
