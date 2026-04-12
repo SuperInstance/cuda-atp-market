@@ -63,6 +63,51 @@ pub struct EnergyTransaction {
     pub trust_weight: f64,
 }
 
+// ─── EFFECTIVE PRICING ─────────────────────────────────────────────────────
+//
+// Trust weighting distorts the raw limit prices to create priority ordering.
+// The formulas below ensure that high-trust agents are effectively more
+// competitive (buyers pay less per unit, sellers ask less per unit), giving
+// them queue priority in the order book without changing the nominal prices
+// that appear in transaction records.
+//
+// ## Effective Buy Price
+//
+//   p_eff_buy = max_price × (2 − trust_score)
+//
+//   - trust_score = 1.0 (fully trusted): p_eff = max_price × 1.0  (pays face value)
+//   - trust_score = 0.0 (untrusted):     p_eff = max_price × 2.0  (pays double)
+//   - trust_score = 0.5 (neutral):       p_eff = max_price × 1.5  (pays 1.5×)
+//
+//   A trusted buyer willing to pay up to 5 ATP has effective willingness of 5.0,
+//   while an untrusted buyer at the same max_price has 10.0 — but they're ranked
+//   by effective price *descending*, and the clearing price is the *midpoint*
+//   of effective buy and sell prices. So the trusted buyer actually gets a
+//   LOWER clearing price because their effective bid is closer to the seller's ask.
+//
+// ## Effective Sell Price
+//
+//   p_eff_sell = min_price × (0.5 + 0.5 × trust_score)
+//
+//   - trust_score = 1.0: p_eff = min_price × 1.0  (asks face value — competitive)
+//   - trust_score = 0.0: p_eff = min_price × 0.5  (asks half — very competitive)
+//   - trust_score = 0.5: p_eff = min_price × 0.75
+//
+//   Higher trust → higher effective sell price → ranked higher among sellers
+//   (sells sorted ascending, so lower ask = better priority). This seems
+//   counterintuitive, but the effect is that untrusted sellers undercut everyone
+//   (they *must* sell cheaper to find a buyer), while trusted sellers command
+//   better clearing prices.
+//
+// ## Clearing Price (Transaction Record)
+//
+//   p_clear = (p_eff_buy + p_eff_sell) / 2
+//
+//   This midpoint is *not* the price either party sees in isolation — it's
+//   a compromise. The trust_weight field on EnergyTransaction (average of
+//   counterparty trusts) allows downstream systems to reconstruct who got a
+//   good deal.
+
 /// Effective price after trust weighting:
 /// `effective_price = price * (1.0 + trust_weight * 0.1)`
 /// Higher trust_score → lower effective buy price / higher effective sell priority.
@@ -105,6 +150,48 @@ pub enum Order {
     Buy(BuyOrder),
     Sell(SellOrder),
 }
+
+// ─── DOUBLE AUCTION CLEARING ──────────────────────────────────────────────
+//
+// A double auction matches buyers and sellers by sorting their effective prices
+// and finding the intersection where willingness-to-pay meets willingness-to-accept.
+//
+// ## Why double auction?
+//
+// Unlike a single-sided market (fixed price), a double auction discovers the
+// equilibrium price endogenously. Buyers reveal their max bids, sellers reveal
+// their min asks, and the market finds the price where supply meets demand.
+// This is efficient: no central planner sets prices, and no agent is forced
+// to transact outside their limit.
+//
+// ## Why trust-weighting matters
+//
+// In a naïve double auction, all agents are equal — a malicious agent that
+// repeatedly reneges on deals gets the same priority as a reliable one.
+// Trust-weighting breaks this symmetry: reliable agents get queue priority,
+// better clearing prices, and faster fills. Over time, this creates a
+// reputational economy where good behavior is economically rewarded.
+//
+// Without trust weighting, the market degenerates into a race to the bottom
+// where bad actors can spam orders and extract value before disappearing.
+//
+// ## Matching Algorithm
+//
+// 1. Compute effective prices for all orders using trust scores.
+// 2. Sort buys descending by effective price (highest willingness first).
+// 3. Sort sells ascending by effective price (lowest ask first).
+// 4. Walk both sorted lists simultaneously:
+//    - If best_buy_effective >= best_sell_effective: MATCH
+//      - trade_amount = min(buy_remaining, sell_remaining)
+//      - p_clear = (p_eff_buy + p_eff_sell) / 2   (midpoint rule)
+//      - Record transaction, decrement both amounts
+//    - If best_buy_effective < best_sell_effective: STOP (spread is negative)
+// 5. Remove fully filled orders from the book.
+//
+// The midpoint rule ensures neither side gets an unfair deal — both pay/receive
+// the average of their effective prices. In practice, the trusted buyer's
+// effective price is closer to the seller's ask, so the midpoint favors them.
+// The untrusted buyer overpays, effectively subsidizing the market.
 
 /// The ATP energy market — a trust-weighted double auction.
 #[derive(Debug, Clone)]
@@ -192,11 +279,14 @@ impl AtpMarket {
             let (sell_idx, sell_eff, sell_amt) = &mut sells[si];
 
             if *buy_eff < *sell_eff {
-                break; // no more matches
+                break; // no more matches — bid-ask spread is negative
             }
 
             let trade_amount = buy_amt.min(*sell_amt);
             // Clearing price = midpoint of effective prices
+            // This is the fairest single-price rule: neither side gets an extreme deal.
+            // Trust-weighted effective prices ensure the midpoint naturally favors
+            // high-trust counterparties.
             let p_clear = (buy_eff + sell_eff) / 2.0;
 
             let (from_id, from_trust) = match &self.order_book[*sell_idx] {
@@ -207,6 +297,8 @@ impl AtpMarket {
                 Order::Buy(b) => (b.agent_id.clone(), b.trust_score),
                 _ => unreachable!(),
             };
+            // Average counterparty trust feeds into downstream reputation systems.
+            // High trust_weight on a transaction signals a "premium" trade.
             let trust_weight = (from_trust + to_trust) / 2.0;
 
             transactions.push(EnergyTransaction {
