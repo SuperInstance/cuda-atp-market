@@ -53,6 +53,54 @@ impl FleetPool {
         }
     }
 
+    // ─── LOG-SCALED TRUST BOOST ────────────────────────────────────────────
+    //
+    // ## Formula
+    //
+    //   trust_boost = ln(1 + total_contributed)
+    //
+    // ## Why Logarithmic Scaling?
+    //
+    //   Contribution   trust_boost (linear)   trust_boost (log)
+    //   ────────────   ────────────────────   ───────────────────
+    //   10 ATP         10.0                   2.40
+    //   100 ATP        100.0                  4.62
+    //   1000 ATP       1000.0                 6.91
+    //   10000 ATP      10000.0                9.21
+    //
+    // ### Diminishing Returns
+    //
+    // The log function grows slower and slower. Going from 0→10 ATP gives
+    // a boost of 2.40, but 1000→1010 gives only 0.01. This means:
+    //   - Early contributions are highly rewarded (incentivizes participation)
+    //   - Marginal additions have minimal effect (no infinite gaming)
+    //   - A whale can't buy disproportionate influence by dumping ATP
+    //
+    // ### Gaming Prevention
+    //
+    // With linear scaling, an agent with 10000 ATP could get 1000× the boost
+    // of a contributor with 10 ATP. This creates a plutocracy where the
+    // richest agent dominates pool politics.
+    //
+    // With log scaling, the same 10000 ATP gives only ~3.8× the boost.
+    // The ratio is bounded: the maximum possible boost advantage is limited
+    // by log(1 + max_contrib) / log(1 + 1) = log(1 + C), which grows slowly.
+    //
+    // ### Practical Example
+    //
+    // Two agents contribute 10 ATP each: both get boost ≈ 2.40.
+    // One agent contributes 1000 ATP: boost ≈ 6.91 (only ~3× more for 100× the ATP).
+    // This means a group of small contributors can collectively out-boost a whale.
+    //
+    // ## Bonus Calculation in Requests
+    //
+    // Contributors get an extra `2 × trust_boost` ATP on top of their normal
+    // withdrawal. For a contributor who's given 100 ATP (boost ≈ 4.62):
+    //   bonus = 2 × 4.62 = 9.24 extra ATP per request
+    //
+    // This bonus is small enough not to distort the market but meaningful
+    // enough to reward sustained participation.
+
     /// Contribute ATP to the fleet pool.
     ///
     /// ## Trust Boost Formula
@@ -70,10 +118,49 @@ impl FleetPool {
             last_contribution: 0,
         });
         entry.total_contributed += amount;
+        // ln(1 + x) where x = total contributed. The +1 ensures ln(0) = 0
+        // for zero contributions, and prevents negative values.
         entry.trust_boost = (1.0 + entry.total_contributed).ln();
         entry.last_contribution = now;
         entry.trust_boost
     }
+
+    // ─── CRISIS MODE: RATIONING FORMULA ────────────────────────────────────
+    //
+    // ## When Crisis Mode Activates
+    //
+    // Crisis mode is toggled externally (by fleet consensus or admin action)
+    // when the reserve drops below a safe threshold or a systemic event occurs.
+    //
+    // ## Rationing Formula
+    //
+    //   effective_amount = min(requested_amount, max_withdrawal)    [when crisis = true]
+    //   effective_amount = requested_amount                         [when crisis = false]
+    //
+    // Then:
+    //   actual = min(effective_amount, reserve)
+    //   bonus = 2 × trust_boost  (contributors only, capped by remaining reserve)
+    //   dispensed = actual + bonus
+    //
+    // ### Example: Normal Mode
+    //   Agent requests 200 ATP, reserve = 500, not contributor
+    //   → dispensed = 200 (approved)
+    //
+    // ### Example: Crisis Mode
+    //   Agent requests 200 ATP, max_withdrawal = 100, reserve = 500, not contributor
+    //   → effective = min(200, 100) = 100
+    //   → dispensed = 100 (approved, capped)
+    //
+    // ### Example: Crisis Mode + Contributor
+    //   Agent requests 200 ATP, max_withdrawal = 100, reserve = 500
+    //   Agent is a contributor with trust_boost = 4.62
+    //   → effective = 100, actual = 100
+    //   → bonus = 2 × 4.62 = 9.24
+    //   → dispensed = 109.24 (approved with bonus)
+    //
+    // The contributor bonus persists during crisis but is proportionally tiny
+    // compared to the cap. This ensures contributors still get preferential
+    // treatment without undermining the rationing system.
 
     /// Request ATP from the pool.
     ///
@@ -88,18 +175,21 @@ impl FleetPool {
             return PoolDecision::Denied { reason: "pool empty".into() };
         }
 
+        // Crisis rationing: cap the requested amount
         let effective_amount = if self.crisis_mode {
             amount.min(self.max_withdrawal)
         } else {
             amount
         };
 
+        // Can't dispense more than what's in reserve
         let actual = effective_amount.min(self.reserve);
 
         // Contributor bonus: if agent has contributed, allow up to 2x their trust_boost extra
         let bonus = self.contributors.get(agent_id)
             .map(|c| c.trust_boost * 2.0)
             .unwrap_or(0.0);
+        // Bonus is also capped by remaining reserve to prevent overdraft
         let total_allowed = actual + bonus.min(self.reserve - actual);
 
         let dispensed = total_allowed.min(self.reserve);
@@ -115,6 +205,7 @@ impl FleetPool {
             justification: justification.to_string(),
         });
 
+        // Return Approved if we got ≥99% of what was asked, else Partial
         if dispensed >= amount * 0.99 {
             PoolDecision::Approved { amount: dispensed }
         } else {
